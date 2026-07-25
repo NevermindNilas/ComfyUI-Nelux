@@ -398,12 +398,11 @@ def _resolve_accelerator(path: str, choice: str) -> str:
 # --------------------------------------------------------------------------- #
 # Trimmed iteration
 #
-# nelux bug (0.16.0), NevermindNilas/Nelux#57: on the nvdec backend,
-# set_range(start, end) followed by
-# iteration seeks to the enclosing keyframe K and then *also* discards `start`
-# frames, so it yields absolute frames K + start .. instead of start .. -- and
-# it does so silently. Verified with a marker clip whose frame index is encoded
-# in its pixels:
+# nelux bug NevermindNilas/Nelux#57: on the nvdec backend, set_range(start, end)
+# followed by iteration seeks to the enclosing keyframe K and then *also*
+# discards `start` frames, so it yields absolute frames K + start .. instead of
+# start .. -- and it does so silently. Verified with a marker clip whose frame
+# index is encoded in its pixels:
 #
 #   GOP 250, set_range(300, 303), nvdec -> frames 550, 551, 552
 #   GOP 250, set_range(500, 503), nvdec -> nothing at all (500 + 500 is past EOF)
@@ -412,6 +411,11 @@ def _resolve_accelerator(path: str, choice: str) -> str:
 # backend, and the batch APIs (get_batch/get_batch_range) are correct on both.
 # So on nvdec we decode from 0 and drop the prefix: still streaming, still on
 # the GPU, and correct. The prefix decode is cheap relative to NVDEC throughput.
+#
+# FIXED UPSTREAM in Nelux#61, but kept: the fix is not in a published wheel
+# (PyPI's latest is 0.16.0, which predates it) and master still reports version
+# 0.16.0, so a fixed build cannot be told from a broken one at runtime. Remove
+# once this pack's nelux floor moves to a release containing the fix.
 # --------------------------------------------------------------------------- #
 def _iter_range(reader, start: int, end: int, accelerator: str):
     """Yield frames [start, end) from `reader`, working around the nvdec seek
@@ -1315,12 +1319,16 @@ class NeluxLoadFrames:
             # nelux's batch API (get_batch_range) would skip the per-frame Python
             # round trip and seek instead of decoding the prefix -- ~1.9x on a
             # strided CPU read starting late in the file -- but on the CPU
-            # backend (NevermindNilas/Nelux#58) it converts YUV->RGB with
-            # BT.601 regardless of the
-            # stream's declared colour space, so a bt709 clip comes out visibly
-            # wrong (byte-exact against `ffmpeg -vf scale=in_color_matrix=bt601`,
-            # max error 40/255 vs plain ffmpeg). Iteration is byte-exact against
-            # ffmpeg, so the node iterates and eats the cost.
+            # backend (NevermindNilas/Nelux#58) it converts YUV->RGB with BT.601
+            # regardless of the stream's declared colour space, so a bt709 clip
+            # comes out visibly wrong (byte-exact against
+            # `ffmpeg -vf scale=in_color_matrix=bt601`, max error 40/255 vs plain
+            # ffmpeg). Iteration is byte-exact against ffmpeg, so the node
+            # iterates and eats the cost.
+            #
+            # FIXED UPSTREAM in Nelux#62, but kept for the same reason as #57
+            # above: not in a published wheel, and the version string cannot
+            # distinguish a fixed build from a broken one.
             frames = [
                 _to_comfy_image(frame)
                 for i, frame in enumerate(_iter_range(reader, start, end, accelerator))

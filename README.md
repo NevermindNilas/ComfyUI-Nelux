@@ -297,19 +297,34 @@ AVOption instead, so `cq` behaves consistently across all three engines.
 
 ## Upstream bugs worked around
 
-Two nelux 0.16.0 defects are handled inside the nodes; both are filed upstream
-and the workarounds can be dropped once they land.
+Two nelux defects found while building this pack. **Both are fixed upstream and
+both workarounds are still active**, because the fixes are not in a release yet:
+
+| | Status |
+|---|---|
+| Fixed on nelux `master` | [#61](https://github.com/NevermindNilas/Nelux/pull/61), [#62](https://github.com/NevermindNilas/Nelux/pull/62) — verified against a local build |
+| In a published wheel | **No.** PyPI's latest is `0.16.0`, which predates both fixes |
+| Removable by version check | **No.** `master` still reports version `0.16.0`, so a fixed build and a broken one are indistinguishable at runtime |
+
+Since `pip install nelux` still yields the affected build, dropping the
+workarounds would silently reintroduce corrupt output. They come out when nelux
+publishes a release containing the fixes and this pack's floor moves to it.
 
 - [Nelux#57](https://github.com/NevermindNilas/Nelux/issues/57) — on NVDEC,
   `set_range(start, end)` + iteration returns frames at absolute index
-  `keyframe + start`, silently. Any trimmed NVDEC read would return footage from
-  the wrong part of the clip. The nodes decode from frame 0 and drop the prefix
-  instead of seeking, which stays streaming and stays on the GPU.
+  `keyframe + start`, silently. Any trimmed NVDEC read returns footage from the
+  wrong part of the clip. The nodes decode from frame 0 and drop the prefix
+  instead of seeking, which stays streaming and stays on the GPU. *Cost while
+  retained: decoding the skipped prefix on a late-starting NVDEC read.*
 - [Nelux#58](https://github.com/NevermindNilas/Nelux/issues/58) — on the CPU
   backend, `decode_batch` / `get_batch_range` converts YUV→RGB with BT.601
   regardless of the stream's declared colour space (up to 40/255 error on a
-  bt709 clip). The nodes never use the batch API, costing ~1.9x on strided reads
-  that start late in a file but keeping output byte-exact against FFmpeg.
+  bt709 clip). The nodes never use the batch API, keeping output byte-exact
+  against FFmpeg. *Cost while retained: ~1.9x on strided reads that start late
+  in a file.*
+
+Both workarounds are correctness-preserving on a fixed build too — they only
+give up speed, never accuracy.
 
 ## Development
 
