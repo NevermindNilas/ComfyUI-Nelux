@@ -1,0 +1,147 @@
+{
+  "clip": "D:\\Nelux\\tests\\data\\test_4k.mp4",
+  "properties": {
+    "width": 3840,
+    "height": 2160,
+    "fps": 30.0,
+    "codec": "h264",
+    "pixel_format": "yuv420p",
+    "total_frames": 300
+  },
+  "frames": 60,
+  "repeats": 3,
+  "nelux": "0.16.0",
+  "torch": "2.13.0+cu132",
+  "rows": [
+    {
+      "group": "probe",
+      "label": "ComfyUI (PyAV av.open)",
+      "seconds": 0.01707940000051167,
+      "fps": null,
+      "output_bytes": null,
+      "baseline": null
+    },
+    {
+      "group": "probe",
+      "label": "nelux.probe",
+      "seconds": 0.01663410000037402,
+      "fps": null,
+      "output_bytes": null,
+      "baseline": 0.01707940000051167
+    },
+    {
+      "group": "decode",
+      "label": "ComfyUI (PyAV)",
+      "seconds": 1.7427957999898354,
+      "fps": 34.42744124145235,
+      "output_bytes": null,
+      "baseline": null
+    },
+    {
+      "group": "decode",
+      "label": "Nelux Load Frames [cpu]",
+      "seconds": 1.4623400999989826,
+      "fps": 41.03012698622006,
+      "output_bytes": null,
+      "baseline": 1.7427957999898354
+    },
+    {
+      "group": "decode",
+      "label": "Nelux Load Frames [nvdec]",
+      "seconds": 1.3205164999963017,
+      "fps": 45.43676659865139,
+      "output_bytes": null,
+      "baseline": 1.7427957999898354
+    },
+    {
+      "group": "encode",
+      "label": "ComfyUI (PyAV libx264)",
+      "seconds": 3.6407163999974728,
+      "fps": 16.480272948489382,
+      "output_bytes": 6266591,
+      "baseline": null
+    },
+    {
+      "group": "encode",
+      "label": "Nelux Encode Frames [libx264]",
+      "seconds": 1.506242999996175,
+      "fps": 39.83421001800663,
+      "output_bytes": 6593349,
+      "baseline": 3.6407163999974728
+    },
+    {
+      "group": "encode",
+      "label": "Nelux Encode Frames [h264_nvenc]",
+      "seconds": 0.9586252000008244,
+      "fps": 62.58963357102275,
+      "output_bytes": 10394427,
+      "baseline": 3.6407163999974728
+    },
+    {
+      "group": "encode",
+      "label": "Nelux Encode Frames [hevc_nvenc]",
+      "seconds": 0.9473877000127686,
+      "fps": 63.332044525373654,
+      "output_bytes": 10253985,
+      "baseline": 3.6407163999974728
+    },
+    {
+      "group": "transcode",
+      "label": "ComfyUI (PyAV decode + encode)",
+      "seconds": 5.426982400007546,
+      "fps": 11.055867806005152,
+      "output_bytes": 6366805,
+      "baseline": null
+    },
+    {
+      "group": "transcode",
+      "label": "Nelux [cpu -> libx264]",
+      "seconds": 1.1726446999964537,
+      "fps": 51.166393367216386,
+      "output_bytes": 6603340,
+      "baseline": 5.426982400007546
+    },
+    {
+      "group": "transcode",
+      "label": "Nelux [cpu -> h264_nvenc]",
+      "seconds": 0.8330872999940766,
+      "fps": 72.02126355836491,
+      "output_bytes": 10388077,
+      "baseline": 5.426982400007546
+    },
+    {
+      "group": "transcode",
+      "label": "Nelux [nvdec -> libx264]",
+      "seconds": 1.077595900002052,
+      "fps": 55.6794991516632,
+      "output_bytes": 6593349,
+      "baseline": 5.426982400007546
+    },
+    {
+      "group": "transcode",
+      "label": "Nelux [nvdec -> h264_nvenc]",
+      "seconds": 0.8151934000052279,
+      "fps": 73.6021660622071,
+      "output_bytes": 9856442,
+      "baseline": 5.426982400007546
+    },
+    {
+      "group": "memory",
+      "label": "ComfyUI (PyAV decode + encode)",
+      "peak_rss_mb": 10014.79296875,
+      "baseline": null
+    },
+    {
+      "group": "memory",
+      "label": "Nelux [cpu -> libx264]",
+      "peak_rss_mb": 2672.15234375,
+      "baseline": 10501271552
+    },
+    {
+      "group": "memory",
+      "label": "Nelux [nvdec -> h264_nvenc]",
+      "peak_rss_mb": 1093.7109375,
+      "baseline": 10501271552
+    }
+  ]
+}

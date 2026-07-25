@@ -1,0 +1,27 @@
+[project]
+name = "comfyui-nelux"
+version = "0.1.0"
+description = "GPU-accelerated video I/O nodes for ComfyUI, backed by Nelux (NVDEC decode / NVENC encode)."
+readme = "README.md"
+license = { text = "AGPL-3.0" }
+requires-python = ">=3.10"
+dependencies = ["nelux>=0.16.0"]
+keywords = ["comfyui", "video", "nvdec", "nvenc", "nelux", "ffmpeg"]
+
+[project.urls]
+Repository = "https://github.com/NevermindNilas/ComfyUI-Nelux"
+BugTracker = "https://github.com/NevermindNilas/ComfyUI-Nelux/issues"
+
+[project.optional-dependencies]
+# PyAV is only needed for the AUDIO output of Get Video Components and for the
+# benchmark's ComfyUI-baseline path. ComfyUI already ships it.
+audio = ["av"]
+dev = ["av", "pytest", "psutil"]
+
+[tool.comfy]
+PublisherId = "nevermindnilas"
+DisplayName = "Nelux Video Nodes"
+Icon = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

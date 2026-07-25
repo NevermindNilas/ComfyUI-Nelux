@@ -1,0 +1,3 @@
+# torch is provided by ComfyUI itself and is deliberately not pinned here.
+# The nelux wheel must match ComfyUI's torch minor -- see the README.
+nelux>=0.16.0

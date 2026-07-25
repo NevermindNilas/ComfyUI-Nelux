@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Benchmark artefacts (the committed results live in benchmarks/)
+/bench*.json
+*.mp4
+*.mkv
+*.mov
+*.webm
