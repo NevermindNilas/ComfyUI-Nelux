@@ -5,7 +5,7 @@ description = "GPU-accelerated video I/O nodes for ComfyUI, backed by Nelux (NVD
 readme = "README.md"
 license = { text = "AGPL-3.0" }
 requires-python = ">=3.10"
-dependencies = ["nelux>=0.16.0"]
+dependencies = ["nelux>=0.16.0", "numpy"]
 keywords = ["comfyui", "video", "nvdec", "nvenc", "nelux", "ffmpeg"]
 
 [project.urls]

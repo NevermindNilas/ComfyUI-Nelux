@@ -1,3 +1,9 @@
 # torch is provided by ComfyUI itself and is deliberately not pinned here.
 # The nelux wheel must match ComfyUI's torch minor -- see the README.
 nelux>=0.16.0
+
+# Used to write the PCM payload when muxing a component-backed VIDEO's audio
+# tensor. ComfyUI already depends on numpy; listed so the pack is honest about
+# what it touches.
+numpy
+

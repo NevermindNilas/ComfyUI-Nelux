@@ -477,10 +477,13 @@ def _nelux_encode(
 ):
     """Encode an IMAGE batch [B,H,W,3] to out_path via nelux. Optionally copy
     audio/subtitles from passthrough_source (no re-encode)."""
-    nelux = _import_nelux()
+    # Validate before importing nelux: a bad container choice should surface as
+    # the actionable "pick mkv or mov" error even on an install where nelux
+    # itself cannot load.
     if images.ndim != 4 or images.shape[-1] != 3:
         raise ValueError("IMAGE batch must be [B,H,W,3]")
     _check_pcm_container(out_path, passthrough_source)
+    nelux = _import_nelux()
     kwargs = _encoder_kwargs(
         nelux, codec, int(images.shape[2]), int(images.shape[1]), fps, preset, cq
     )
