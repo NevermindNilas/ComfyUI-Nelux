@@ -32,12 +32,46 @@ against another, so install it with **ComfyUI's own Python**. If ComfyUI Desktop
 bundles a torch version with no matching Nelux wheel, the nodes raise a clear
 error at load time rather than crashing the process.
 
-On Windows, point the nodes at your FFmpeg DLLs before starting ComfyUI (they are
-added to the DLL search path before `nelux` is imported):
+### FFmpeg
+
+**Nothing to do — the nodes fetch it themselves.** The nelux wheel deliberately
+does not bundle FFmpeg (its build sets `NELUX_BUNDLE_FFMPEG_DLLS=OFF` so it can
+share the copy TheAnimeScripter already ships), which leaves a bare ComfyUI
+install with none. On first use the nodes check whether the DLLs are resolvable
+and, if not, download a build once (~3 s) into a per-user cache:
 
 ```
-set NELUX_FFMPEG_DLL_DIR=C:\path\to\ffmpeg\bin
+%LOCALAPPDATA%\ComfyUI-Nelux\ffmpeg\bin
 ```
+
+This check cannot be skipped, because nelux **delay-loads** FFmpeg: `import
+nelux` succeeds with no FFmpeg installed at all, and the failure only lands
+later, inside the first decode, as an uncatchable process abort (`0xC06D007E`)
+that takes ComfyUI down with it. So the nodes verify `avcodec` and friends are
+loadable up front rather than waiting for an error that never arrives as an
+exception.
+
+Two environment variables, if you would rather manage it yourself:
+
+| Variable | Effect |
+|---|---|
+| `NELUX_FFMPEG_DLL_DIR` | Use this FFmpeg directory; no download. (`FFMPEG_DLL_DIR` also works.) |
+| `NELUX_NO_AUTO_DOWNLOAD=1` | Never download; raise with the missing DLL names instead. |
+| `NELUX_FFMPEG_CACHE_DIR` | Download somewhere other than `%LOCALAPPDATA%`. |
+
+The archive is BtbN's `ffmpeg-master-latest-win64-gpl-shared` — the same URL
+nelux's own wheel workflow builds against, which is what keeps the `avcodec` /
+`avutil` sonames and the NVENC/QSV feature set matched to the extension. Only
+`bin/*.dll` is extracted, by basename, so nothing in the archive can write
+outside the cache directory.
+
+> It is fetched **unpinned**, so there is no checksum to verify the DLLs
+> against — the trust boundary is GitHub plus that release. Use
+> `NELUX_FFMPEG_DLL_DIR` with an FFmpeg you manage if that is not acceptable for
+> your install.
+
+On Linux and macOS nothing is downloaded; install FFmpeg from your package
+manager.
 
 ## Nodes
 

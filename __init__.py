@@ -26,16 +26,21 @@ silently downgrading. Availability always comes from opening the real
 decoder/encoder -- FFmpeg's build-time codec list says nothing about whether
 this machine can run it.
 
-Nelux must be importable in Comfy's Python (torch ABI must match the wheel). On
-Windows the FFmpeg DLLs are located via NELUX_FFMPEG_DLL_DIR / FFMPEG_DLL_DIR;
-set one of those env vars for your install.
+Nelux must be importable in Comfy's Python (torch ABI must match the wheel).
+
+FFmpeg needs no setup: nelux delay-loads it and does not bundle it, so on
+Windows these nodes check the DLLs are resolvable and fetch a build once, into a
+per-user cache, if they are not. Point NELUX_FFMPEG_DLL_DIR at your own FFmpeg
+to use that instead, or set NELUX_NO_AUTO_DOWNLOAD=1 to disable the fetch.
 """
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import tempfile
+import threading
 import wave
 
 import torch
@@ -53,28 +58,244 @@ def _warn_once(key: str, message: str) -> None:
 
 # --------------------------------------------------------------------------- #
 # Runtime dependency loading (kept lazy so this module imports without Comfy).
+#
+# The published nelux wheel deliberately does not bundle FFmpeg: its build sets
+# NELUX_BUNDLE_FFMPEG_DLLS=OFF so it can share the copy TheAnimeScripter already
+# ships. That leaves a bare ComfyUI install with no FFmpeg at all, so the nodes
+# fetch one on first use.
+#
+# The archive is BtbN's win64-gpl-shared build -- the same URL nelux's own wheel
+# workflow builds against, which is what keeps the avcodec/avutil sonames and the
+# nvenc/qsv feature set matched to the extension. It is fetched unpinned ("latest"
+# by request), so the trust boundary is GitHub plus that release: there is no
+# hash to verify a downloaded DLL against. Set NELUX_FFMPEG_DLL_DIR to an FFmpeg
+# you manage yourself, or NELUX_NO_AUTO_DOWNLOAD=1 to turn the fetch off, if that
+# is not acceptable for your install.
 # --------------------------------------------------------------------------- #
 _DLL_HANDLES = []
+_NELUX_MODULE = None
+_FFMPEG_LOCK = threading.Lock()
+
+_FFMPEG_URL = (
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
+    "ffmpeg-master-latest-win64-gpl-shared.zip"
+)
 
 
-def _add_dll_dir(path: str) -> None:
-    if os.name == "nt" and path and os.path.isdir(path):
+def _is_windows() -> bool:
+    """Seam so the loader's platform behaviour can be exercised in tests."""
+    return os.name == "nt"
+
+
+def _add_dll_dir(path: str | None) -> None:
+    if _is_windows() and path and os.path.isdir(path):
         _DLL_HANDLES.append(os.add_dll_directory(path))
 
 
-def _import_nelux():
-    for path in (os.environ.get("NELUX_FFMPEG_DLL_DIR"), os.environ.get("FFMPEG_DLL_DIR")):
-        _add_dll_dir(path)
+def _configured_dll_dirs() -> list[str]:
+    return [
+        path
+        for path in (os.environ.get("NELUX_FFMPEG_DLL_DIR"),
+                     os.environ.get("FFMPEG_DLL_DIR"))
+        if path
+    ]
+
+
+def _ffmpeg_cache_dir() -> str:
+    """Where a downloaded FFmpeg lives. Kept out of the node directory so a
+    read-only or git-managed checkout is never written to."""
+    override = os.environ.get("NELUX_FFMPEG_CACHE_DIR")
+    if override:
+        return override
+    base = (
+        os.environ.get("LOCALAPPDATA")
+        or os.environ.get("XDG_CACHE_HOME")
+        or os.path.expanduser("~/.cache")
+    )
+    return os.path.join(base, "ComfyUI-Nelux", "ffmpeg")
+
+
+def _auto_download_enabled() -> bool:
+    if not _is_windows():
+        return False  # Linux/macOS get FFmpeg from the system package manager
+    return os.environ.get("NELUX_NO_AUTO_DOWNLOAD", "").strip().lower() not in (
+        "1", "true", "yes", "on",
+    )
+
+
+# nelux DELAY-loads FFmpeg (checked against _nelux.pyd's delay-import
+# directory: avcodec-63, avformat-63, avutil-61, swscale-10, swresample-7).
+# Delay-loading means `import nelux` SUCCEEDS with no FFmpeg installed at all --
+# the loader only looks when a symbol is first called, and then fails as an
+# uncatchable process abort (0xC06D007E, the delay-load helper) that takes
+# ComfyUI down with it. So there is no ImportError to react to: the DLLs have to
+# be checked directly, before anything calls into the extension.
+#
+# Each entry lists the sonames that satisfy one dependency, newest first --
+# mirroring nelux's own fallback table, so a wheel built against either FFmpeg
+# generation is accepted.
+_REQUIRED_FFMPEG_DLLS = (
+    ("avcodec-63.dll", "avcodec-62.dll"),
+    ("avformat-63.dll", "avformat-62.dll"),
+    ("avutil-61.dll", "avutil-60.dll"),
+    ("swscale-10.dll", "swscale-9.dll"),
+    ("swresample-7.dll", "swresample-6.dll"),
+)
+
+
+def _can_load_dll(name: str) -> bool:
+    """Can the loader resolve `name` right now? ctypes searches the same
+    directories os.add_dll_directory() feeds the delay-load helper, and raises
+    OSError instead of aborting, which makes this safe to ask."""
     try:
-        import nelux
-    except ImportError as exc:
+        ctypes.WinDLL(name)
+        return True
+    except OSError:
+        return False
+
+
+def _missing_ffmpeg_dlls() -> list[str]:
+    """The FFmpeg dependencies that cannot currently be resolved, one name per
+    unsatisfied dependency."""
+    if not _is_windows():
+        return []
+    return [
+        alternatives[0]
+        for alternatives in _REQUIRED_FFMPEG_DLLS
+        if not any(_can_load_dll(name) for name in alternatives)
+    ]
+
+
+def _download_ffmpeg(destination: str) -> str:
+    """Fetch and unpack FFmpeg's runtime DLLs into `destination`/bin.
+
+    Extraction is atomic: everything lands in a sibling temp directory and is
+    renamed into place only once complete, so an interrupted download can never
+    leave a half-populated directory that later looks like a valid cache."""
+    import shutil
+    import urllib.request
+    import zipfile
+
+    parent = os.path.dirname(destination) or "."
+    os.makedirs(parent, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix="ffmpeg-dl-", dir=parent)
+    archive = os.path.join(staging, "ffmpeg.zip")
+
+    _LOG.info("Nelux: downloading FFmpeg runtime DLLs from %s", _FFMPEG_URL)
+    try:
+        request = urllib.request.Request(
+            _FFMPEG_URL, headers={"User-Agent": "ComfyUI-Nelux"}
+        )
+        with urllib.request.urlopen(request, timeout=120) as response, \
+                open(archive, "wb") as out:
+            shutil.copyfileobj(response, out)
+
+        bin_dir = os.path.join(staging, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        with zipfile.ZipFile(archive) as zf:
+            members = [
+                name for name in zf.namelist()
+                if name.lower().endswith(".dll") and "/bin/" in name.replace("\\", "/")
+            ]
+            if not members:
+                raise RuntimeError(
+                    "the FFmpeg archive contained no bin/*.dll entries"
+                )
+            for name in members:
+                # Flatten: take the basename only, so a crafted path inside the
+                # archive cannot escape the destination directory.
+                target = os.path.join(bin_dir, os.path.basename(name))
+                with zf.open(name) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+        if not any(f.startswith("avcodec-") for f in os.listdir(bin_dir)):
+            raise RuntimeError("the FFmpeg archive contained no avcodec DLL")
+
+        os.remove(archive)
+        if os.path.isdir(destination):
+            shutil.rmtree(destination, ignore_errors=True)
+        os.replace(staging, destination)
+        _LOG.info("Nelux: FFmpeg installed to %s", destination)
+        return os.path.join(destination, "bin")
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _ensure_ffmpeg() -> None:
+    """Make nelux's delay-loaded FFmpeg resolvable, downloading it if needed.
+
+    Order: whatever the user configured, then whatever the system already
+    provides, then a previously downloaded copy, then a fresh download."""
+    for path in _configured_dll_dirs():
+        _add_dll_dir(path)
+    if not _missing_ffmpeg_dlls():
+        return
+
+    cached = os.path.join(_ffmpeg_cache_dir(), "bin")
+    if os.path.isdir(cached):
+        _add_dll_dir(cached)
+        if not _missing_ffmpeg_dlls():
+            return
+
+    missing = _missing_ffmpeg_dlls()
+    if not _auto_download_enabled():
         raise ImportError(
-            "Nelux failed to import in Comfy's Python. Install a Nelux wheel built "
-            "for this Comfy torch/Python combo; Comfy Desktop's bundled torch may "
-            "not match the published Nelux wheel ABI. On Windows, also set "
-            "NELUX_FFMPEG_DLL_DIR to the directory holding the FFmpeg DLLs."
+            f"Nelux needs FFmpeg, and these DLLs cannot be found: "
+            f"{', '.join(missing)}.\nAutomatic download is disabled "
+            f"(NELUX_NO_AUTO_DOWNLOAD), so set NELUX_FFMPEG_DLL_DIR to a "
+            f"directory containing them."
+        )
+
+    _LOG.info("Nelux: FFmpeg not found (%s); fetching it once",
+              ", ".join(missing))
+    try:
+        _add_dll_dir(_download_ffmpeg(_ffmpeg_cache_dir()))
+    except Exception as exc:  # network down, proxy, disk full, ...
+        raise ImportError(
+            f"Nelux needs FFmpeg ({', '.join(missing)}) and downloading it "
+            f"failed: {exc}\nSet NELUX_FFMPEG_DLL_DIR to a directory holding "
+            f"the FFmpeg DLLs, or fix network access and retry."
         ) from exc
-    return nelux
+
+    still_missing = _missing_ffmpeg_dlls()
+    if still_missing:
+        raise ImportError(
+            f"Nelux still cannot load {', '.join(still_missing)} after "
+            f"downloading FFmpeg into {_ffmpeg_cache_dir()}. The build fetched "
+            f"probably does not match the sonames this Nelux wheel was linked "
+            f"against; set NELUX_FFMPEG_DLL_DIR to a matching FFmpeg."
+        )
+
+
+def _import_nelux():
+    """Import nelux with its FFmpeg dependency guaranteed present.
+
+    The FFmpeg check has to happen here rather than around the import: nelux
+    delay-loads FFmpeg, so the import succeeds either way and the failure only
+    lands later, as a process abort inside the first decode."""
+    global _NELUX_MODULE
+    if _NELUX_MODULE is not None:
+        return _NELUX_MODULE
+
+    with _FFMPEG_LOCK:
+        if _NELUX_MODULE is not None:
+            return _NELUX_MODULE
+
+        _ensure_ffmpeg()
+        try:
+            import nelux
+        except ImportError as exc:
+            raise ImportError(
+                "Nelux failed to import in Comfy's Python. The wheel most "
+                "likely does not match this Python or this PyTorch minor "
+                "version -- Comfy Desktop's bundled torch often differs from "
+                "the published wheel's ABI. Install a Nelux wheel built for "
+                "this combination."
+            ) from exc
+
+        _NELUX_MODULE = nelux
+        return nelux
 
 
 def _comfy_video_api():

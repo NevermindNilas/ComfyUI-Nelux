@@ -91,6 +91,181 @@ def _video(cls, start_time=0.0, duration=0.0, clip_seconds=30.0, fps=30.0):
 
 
 # --------------------------------------------------------------------------- #
+# FFmpeg bootstrap
+#
+# nelux DELAY-loads FFmpeg, so `import nelux` succeeds with no FFmpeg present
+# and the failure only lands later, inside the first decode, as an uncatchable
+# process abort. The DLLs therefore have to be checked directly, up front.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def win_nodes(monkeypatch):
+    """Node module that believes it is on Windows, with a clean environment."""
+    nodes = _load_nodes()
+    monkeypatch.setattr(nodes, "_is_windows", lambda: True)
+    monkeypatch.setattr(nodes, "_add_dll_dir", lambda path: None)
+    for var in ("NELUX_FFMPEG_DLL_DIR", "FFMPEG_DLL_DIR",
+                "NELUX_FFMPEG_CACHE_DIR", "NELUX_NO_AUTO_DOWNLOAD"):
+        monkeypatch.delenv(var, raising=False)
+    return nodes
+
+
+def _loadable(nodes, monkeypatch, *names):
+    monkeypatch.setattr(nodes, "_can_load_dll", lambda name: name in set(names))
+
+
+def test_missing_ffmpeg_lists_every_unsatisfied_dependency(win_nodes, monkeypatch):
+    _loadable(win_nodes, monkeypatch)
+    assert win_nodes._missing_ffmpeg_dlls() == [
+        "avcodec-63.dll", "avformat-63.dll", "avutil-61.dll",
+        "swscale-10.dll", "swresample-7.dll",
+    ]
+
+
+def test_either_ffmpeg_generation_satisfies_the_requirement(win_nodes, monkeypatch):
+    # A wheel linked against the older sonames must not trigger a download.
+    _loadable(win_nodes, monkeypatch, "avcodec-62.dll", "avformat-62.dll",
+              "avutil-60.dll", "swscale-9.dll", "swresample-6.dll")
+    assert win_nodes._missing_ffmpeg_dlls() == []
+
+
+def test_nothing_is_downloaded_when_ffmpeg_is_already_there(win_nodes, monkeypatch):
+    _loadable(win_nodes, monkeypatch, "avcodec-63.dll", "avformat-63.dll",
+              "avutil-61.dll", "swscale-10.dll", "swresample-7.dll")
+    monkeypatch.setattr(win_nodes, "_download_ffmpeg", lambda dest: pytest.fail(
+        "downloaded FFmpeg despite it already being loadable"))
+
+    win_nodes._ensure_ffmpeg()
+
+
+def test_ffmpeg_is_downloaded_once_when_missing(win_nodes, monkeypatch, tmp_path):
+    calls = []
+    resolved = {"ok": False}
+    monkeypatch.setattr(win_nodes, "_can_load_dll", lambda name: resolved["ok"])
+
+    def fake_download(destination):
+        calls.append(destination)
+        resolved["ok"] = True
+        return str(tmp_path / "bin")
+
+    monkeypatch.setattr(win_nodes, "_download_ffmpeg", fake_download)
+    monkeypatch.setenv("NELUX_FFMPEG_CACHE_DIR", str(tmp_path))
+
+    win_nodes._ensure_ffmpeg()
+    win_nodes._ensure_ffmpeg()  # already resolvable now
+
+    assert calls == [str(tmp_path)]
+
+
+def test_download_can_be_turned_off(win_nodes, monkeypatch):
+    _loadable(win_nodes, monkeypatch)
+    monkeypatch.setenv("NELUX_NO_AUTO_DOWNLOAD", "1")
+    monkeypatch.setattr(win_nodes, "_download_ffmpeg", lambda dest: pytest.fail(
+        "downloaded FFmpeg despite NELUX_NO_AUTO_DOWNLOAD"))
+
+    with pytest.raises(ImportError, match="Automatic download is disabled"):
+        win_nodes._ensure_ffmpeg()
+
+
+def test_a_failed_download_explains_itself(win_nodes, monkeypatch):
+    _loadable(win_nodes, monkeypatch)
+
+    def boom(destination):
+        raise OSError("no route to host")
+
+    monkeypatch.setattr(win_nodes, "_download_ffmpeg", boom)
+
+    with pytest.raises(ImportError, match="no route to host"):
+        win_nodes._ensure_ffmpeg()
+
+
+def test_a_download_that_does_not_satisfy_the_sonames_is_reported(
+    win_nodes, monkeypatch, tmp_path
+):
+    # An FFmpeg build of the wrong generation would otherwise leave the nodes to
+    # abort inside the first decode instead of saying what went wrong.
+    _loadable(win_nodes, monkeypatch)
+    monkeypatch.setattr(win_nodes, "_download_ffmpeg", lambda dest: str(tmp_path))
+
+    with pytest.raises(ImportError, match="does not match the sonames"):
+        win_nodes._ensure_ffmpeg()
+
+
+def test_non_windows_never_checks_or_downloads(monkeypatch):
+    nodes = _load_nodes()
+    monkeypatch.setattr(nodes, "_is_windows", lambda: False)
+
+    assert nodes._missing_ffmpeg_dlls() == []
+    assert nodes._auto_download_enabled() is False
+
+
+def test_cache_dir_is_outside_the_node_directory(monkeypatch, tmp_path):
+    # A checkout can be read-only or git-managed; downloads must not land in it.
+    nodes = _load_nodes()
+    monkeypatch.delenv("NELUX_FFMPEG_CACHE_DIR", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    cache = Path(nodes._ffmpeg_cache_dir())
+
+    assert tmp_path in cache.parents
+    assert Path(nodes.__file__).parent not in cache.parents
+
+
+def test_cache_dir_override_wins(monkeypatch, tmp_path):
+    nodes = _load_nodes()
+    monkeypatch.setenv("NELUX_FFMPEG_CACHE_DIR", str(tmp_path / "elsewhere"))
+    assert nodes._ffmpeg_cache_dir() == str(tmp_path / "elsewhere")
+
+
+def test_download_flattens_archive_paths(monkeypatch, tmp_path):
+    """Entries are taken by basename, so a crafted path cannot escape the
+    destination, and the DLLs land in one flat directory the loader can search."""
+    import io
+    import zipfile
+
+    nodes = _load_nodes()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("ffmpeg-master/bin/avcodec-63.dll", b"codec")
+        zf.writestr("ffmpeg-master/bin/avutil-61.dll", b"util")
+        zf.writestr("ffmpeg-master/bin/../../evil/bin/pwned.dll", b"evil")
+        zf.writestr("ffmpeg-master/doc/readme.txt", b"not a dll")
+        zf.writestr("ffmpeg-master/lib/avcodec.lib", b"import lib")
+    payload = buffer.getvalue()
+
+    monkeypatch.setattr(
+        __import__("urllib.request", fromlist=["request"]), "urlopen",
+        lambda request, timeout=None: io.BytesIO(payload),
+    )
+
+    destination = tmp_path / "ffmpeg"
+    bin_dir = Path(nodes._download_ffmpeg(str(destination)))
+
+    names = sorted(p.name for p in bin_dir.iterdir())
+    assert names == ["avcodec-63.dll", "avutil-61.dll", "pwned.dll"]
+    assert not (tmp_path / "evil").exists()  # never escaped
+    assert bin_dir == destination / "bin"
+
+
+def test_an_archive_without_ffmpeg_is_rejected(monkeypatch, tmp_path):
+    import io
+    import zipfile
+
+    nodes = _load_nodes()
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("something/bin/unrelated.dll", b"nope")
+    payload = buffer.getvalue()
+    monkeypatch.setattr(
+        __import__("urllib.request", fromlist=["request"]), "urlopen",
+        lambda request, timeout=None: io.BytesIO(payload),
+    )
+
+    with pytest.raises(RuntimeError, match="no avcodec DLL"):
+        nodes._download_ffmpeg(str(tmp_path / "ffmpeg"))
+    assert not (tmp_path / "ffmpeg").exists()  # nothing half-written left behind
+
+
+# --------------------------------------------------------------------------- #
 # Node contract
 # --------------------------------------------------------------------------- #
 def test_comfy_image_roundtrip_shape_dtype():
