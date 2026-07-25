@@ -46,18 +46,58 @@ All under the **Nelux** category.
 | Node | In → Out | Notes |
 |------|----------|-------|
 | **Nelux Load Video** | file → `VIDEO` | Lazy. Frames decode on demand, on the GPU. |
-| **Nelux Save Video** | `VIDEO` → `VIDEO` | NVENC encode + lossless audio passthrough. |
+| **Nelux Save Video** | `VIDEO` → `VIDEO` | Hardware encode + lossless audio passthrough. |
 | **Nelux Video Info** | path → dims/fps/frames/codec/… | Container header only, no decode. |
 | **Nelux Load Frames** | path → `IMAGE` | Direct frame-range/step decode to an IMAGE batch. |
 | **Nelux Encode Frames** | `IMAGE` → path | Direct IMAGE batch → file (no audio). |
 
-### Decode accelerator
+## Choosing the engine
 
-Every decode node takes `decode_accelerator`, defaulting to **`auto`**: it probes
-once per codec for a working hardware decoder (NVDEC, then QSV) and falls back to
-the CPU, so the pack works unchanged on a machine with no GPU. Choosing `nvdec`,
-`qsv` or `cpu` explicitly is honoured as written — an explicit hardware request
-raises rather than silently downgrading.
+Decode and encode each expose their own engine picker, and both default to
+`auto`. An explicit choice is always honoured as written — if the hardware
+cannot do it, the node raises instead of silently handing back a software
+encode you did not ask for.
+
+### Decode — `decode_accelerator`
+
+On **Nelux Load Video** and **Nelux Load Frames**: `auto` · `nvdec` · `qsv` ·
+`cpu`. Nelux Save Video reuses whatever the Load Video feeding it was set to.
+
+`auto` probes once per codec for a working hardware decoder and falls back to the
+CPU, so the pack works unchanged on a machine with no GPU. The probe opens the
+decoder exactly the way the nodes decode (`force_8bit=True`), because that
+changes which pixel formats a backend has to handle and so can change the answer.
+
+> **QSV decode is not in nelux 0.16.0** — its `Factory.hpp` maps only CPU and
+> NVDEC, so picking `qsv` there raises with a message saying so. The option is
+> listed for builds that add it; `auto` simply never selects it. QSV *encode* is
+> unrelated and does work — that lives in FFmpeg, not in a nelux decode backend.
+
+### Encode — `encoder_engine`
+
+On **Nelux Save Video** and **Nelux Encode Frames**: `auto` · `nvenc` · `qsv` ·
+`cpu`. It pairs with `codec`:
+
+| `codec` | `nvenc` | `qsv` | `cpu` |
+|---|---|---|---|
+| `h264` (and `auto`) | `h264_nvenc` | `h264_qsv` | `libx264` |
+| `hevc` | `hevc_nvenc` | `hevc_qsv` | `libx265` |
+| `av1` | `av1_nvenc` | `av1_qsv` | `libsvtav1` |
+
+`auto` walks NVENC → QSV → CPU and takes the first that works. Naming an **exact**
+encoder (`h264_nvenc`, `libx265`, …) in `codec` overrides `encoder_engine`
+entirely, which also keeps workflows saved before `encoder_engine` existed
+loading unchanged.
+
+Availability is decided by **actually opening the encoder**, not by asking FFmpeg
+what it was compiled with. `nelux.get_available_encoders()` /
+`get_nvenc_encoders()` just enumerate build-time codecs, and this FFmpeg build
+lists NVENC, QSV, AMF and VAAPI encoders on every platform — trusting that list
+makes `auto` pick `h264_nvenc` on an AMD-only box and then die inside
+`avcodec_open2`. Opening the encoder also catches per-GPU limits a name list
+never could: `av1_nvenc` is in every build and fails on an RTX 3090, because AV1
+encode starts at Ada. Each probe runs once and is cached (~80 ms NVENC, ~500 ms
+QSV); software encoders are never probed.
 
 ## Benchmarks
 
@@ -184,12 +224,20 @@ you are only transcoding.
 
 `preset` is expressed on NVENC's `p1` (fastest) … `p7` (best quality) ladder and
 is translated into whatever family the resolved encoder actually speaks — `p4`
-becomes `medium` on libx264/libx265. `auto` lets the encoder pick its own
-default. FFmpeg's own names (`veryfast`, `slow`, …) and codec-specific values
-(`lossless`) are accepted and translated the same way.
+becomes `medium` on libx264/libx265 and on QSV. `auto` lets the encoder pick its
+own default. FFmpeg's own names (`veryfast`, `slow`, …) and codec-specific values
+(`lossless`) are accepted and translated the same way. QSV has no
+`ultrafast`/`superfast` rung, so its ladder sits one step slower at the fast end.
 
 > Passing an NVENC preset name straight to a software encoder is an error
 > (`x264 [error]: invalid preset 'p4'`), which is why the node normalizes it.
+
+`cq` is the quality knob for every engine, but it does not reach QSV by the same
+route. nelux maps `cq` onto `crf`/`qp` for x264/x265, SVT-AV1, libaom and NVENC;
+QSV matches none of those branches, so passing `cq` there is **accepted and
+silently dropped** — encoding the same clip with and without it gives
+byte-identical output. The node therefore forwards QSV's own `global_quality`
+AVOption instead, so `cq` behaves consistently across all three engines.
 
 ## Audio
 

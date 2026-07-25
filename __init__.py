@@ -15,9 +15,16 @@ nodes -- routing an IMAGE workflow through Nelux Load Video makes the subsequent
 decode use NVDEC, and feeding a Create Video result to Nelux Save Video makes the
 encode use NVENC.
 
-Every decode node defaults to ``decode_accelerator="auto"``, which probes for a
-hardware decoder once per codec and falls back to the CPU, so the pack works
-unchanged on a machine with no GPU.
+Decode and encode each pick their own engine, and both default to "auto":
+
+  - ``decode_accelerator``: auto / nvdec / qsv / cpu  (Load Video, Load Frames)
+  - ``encoder_engine``:     auto / nvenc / qsv / cpu  (Save Video, Encode Frames)
+
+"auto" probes for working hardware and falls back to the CPU, so the pack works
+unchanged on a machine with no GPU; an explicit choice raises rather than
+silently downgrading. Availability always comes from opening the real
+decoder/encoder -- FFmpeg's build-time codec list says nothing about whether
+this machine can run it.
 
 Nelux must be importable in Comfy's Python (torch ABI must match the wheel). On
 Windows the FFmpeg DLLs are located via NELUX_FFMPEG_DLL_DIR / FFMPEG_DLL_DIR;
@@ -104,17 +111,29 @@ def _probe(path: str) -> dict:
 # --------------------------------------------------------------------------- #
 # Decode accelerator resolution
 #
-# nelux accepts exactly 'cpu', 'nvdec' and 'qsv' -- there is no 'auto', so the
-# node resolves it. "auto" must never hard-fail on a machine with no NVIDIA GPU,
-# which is what a plain default of "nvdec" would do.
+# nelux has no "auto", so the node resolves it: a plain default of "nvdec" would
+# hard-fail on any machine without an NVIDIA GPU.
+#
+# Which backends exist depends on the nelux build. Every release has 'cpu' and
+# 'nvdec'; 'qsv' decode is NOT in nelux 0.16.0 (its Factory.hpp maps only CPU and
+# NVDEC) and is rejected at construction there. It stays on the list because the
+# option is cheap and forward-looking -- "auto" simply never selects a backend it
+# could not open, and an explicit pick gets a message that says what happened.
+# QSV *encode* is unrelated and does work: that lives in FFmpeg, not in a nelux
+# decode backend.
 # --------------------------------------------------------------------------- #
 _ACCELERATORS = ["auto", "nvdec", "qsv", "cpu"]
+_HARDWARE_ACCELERATORS = ("nvdec", "qsv")
 _ACCEL_CACHE: dict[str, str] = {}
 
 
 def _accelerator_works(nelux, path: str, accelerator: str) -> bool:
+    """Can this machine decode `path` with `accelerator`? Probed exactly the way
+    the nodes decode, since force_8bit changes which pixel formats a backend has
+    to handle and so can change the answer."""
     try:
-        with nelux.VideoReader(path, decode_accelerator=accelerator):
+        with nelux.VideoReader(path, force_8bit=True,
+                               decode_accelerator=accelerator):
             return True
     except Exception:
         return False
@@ -122,13 +141,24 @@ def _accelerator_works(nelux, path: str, accelerator: str) -> bool:
 
 def _resolve_accelerator(path: str, choice: str) -> str:
     """Map the node's accelerator choice onto one nelux accepts. "auto" probes
-    for a working hardware decoder once per (codec, choice) and remembers the
-    answer; anything else is passed through so an explicit request still raises
-    rather than silently downgrading."""
+    for a working hardware decoder once per codec and remembers the answer;
+    an explicit choice is passed through, so it raises rather than silently
+    downgrading -- but with a message that names the actual problem."""
     name = (choice or "auto").strip().lower()
-    if name != "auto":
-        return name
     nelux = _import_nelux()
+
+    if name != "auto":
+        if name in _HARDWARE_ACCELERATORS and not _accelerator_works(
+            nelux, path, name
+        ):
+            raise RuntimeError(
+                f"Nelux: decode_accelerator='{name}' cannot decode this file on "
+                f"this machine. Either the hardware/driver is missing, or this "
+                f"nelux build has no {name} decode backend (0.16.0 ships 'cpu' "
+                f"and 'nvdec' only). Use 'auto' to take whatever is present."
+            )
+        return name
+
     try:
         key = str(_probe(path).get("codec", "?"))
     except Exception:
@@ -136,7 +166,7 @@ def _resolve_accelerator(path: str, choice: str) -> str:
     cached = _ACCEL_CACHE.get(key)
     if cached is not None:
         return cached
-    for candidate in ("nvdec", "qsv"):
+    for candidate in _HARDWARE_ACCELERATORS:
         if _accelerator_works(nelux, path, candidate):
             _ACCEL_CACHE[key] = candidate
             return candidate
@@ -184,6 +214,7 @@ def _iter_range(reader, start: int, end: int, accelerator: str):
 # single user-facing preset onto whatever family the resolved encoder speaks.
 # --------------------------------------------------------------------------- #
 _NVENC_CODECS = frozenset({"h264_nvenc", "hevc_nvenc", "av1_nvenc"})
+_QSV_CODECS = frozenset({"h264_qsv", "hevc_qsv", "av1_qsv", "vp9_qsv", "mpeg2_qsv"})
 _X26X_CODECS = frozenset({"libx264", "libx264rgb", "libx265"})
 
 # Every accepted preset name collapses onto a 1 (fastest) .. 7 (best) rung.
@@ -197,15 +228,29 @@ _X26X_BY_RUNG = {
     1: "ultrafast", 2: "veryfast", 3: "faster", 4: "medium",
     5: "slow", 6: "slower", 7: "veryslow",
 }
+# QSV has no "ultrafast"/"superfast" rung, so its seven names sit one step
+# slower than the x26x ladder at the fast end.
+_QSV_BY_RUNG = {
+    1: "veryfast", 2: "faster", 3: "fast", 4: "medium",
+    5: "slow", 6: "slower", 7: "veryslow",
+}
 
-# Comfy's VideoCodec values (and "auto") -> (preferred hardware, software fallback).
-_CODEC_FALLBACKS = {
-    "auto": ("h264_nvenc", "libx264"),
-    "h264": ("h264_nvenc", "libx264"),
-    "avc1": ("h264_nvenc", "libx264"),
-    "h265": ("hevc_nvenc", "libx265"),
-    "hevc": ("hevc_nvenc", "libx265"),
-    "av1": ("av1_nvenc", "libsvtav1"),
+# The three engines a user can pick, fastest-hardware-first. "cpu" is last and
+# is the only one guaranteed to exist.
+_ENGINES = ["auto", "nvenc", "qsv", "cpu"]
+_ENGINE_ORDER = ("nvenc", "qsv", "cpu")
+
+# Codec family -> the encoder each engine uses for it.
+_ENCODER_TABLE = {
+    "h264": {"nvenc": "h264_nvenc", "qsv": "h264_qsv", "cpu": "libx264"},
+    "hevc": {"nvenc": "hevc_nvenc", "qsv": "hevc_qsv", "cpu": "libx265"},
+    "av1": {"nvenc": "av1_nvenc", "qsv": "av1_qsv", "cpu": "libsvtav1"},
+}
+# Everything a user (or Comfy's VideoCodec enum) might name a family.
+_FAMILY_ALIASES = {
+    "auto": "h264", "h264": "h264", "avc1": "h264", "avc": "h264",
+    "h265": "hevc", "hevc": "hevc", "hvc1": "hevc",
+    "av1": "av1", "av01": "av1",
 }
 
 
@@ -223,47 +268,135 @@ def _resolve_preset(encoder: str, preset) -> str | None:
         return str(preset).strip()
     if encoder in _NVENC_CODECS:
         return f"p{rung}"
+    if encoder in _QSV_CODECS:
+        return _QSV_BY_RUNG[rung]
     if encoder in _X26X_CODECS:
         return _X26X_BY_RUNG[rung]
     return None
 
 
-def _available_nvenc(nelux) -> set[str]:
+# --------------------------------------------------------------------------- #
+# Encoder availability
+#
+# nelux.get_available_encoders()/get_nvenc_encoders() enumerate what FFmpeg was
+# *compiled* with (av_codec_iterate + a name filter) -- they say nothing about
+# whether this machine can actually run the encoder. This build lists NVENC,
+# QSV, AMF and VAAPI encoders on every platform, so trusting that list makes
+# "auto" pick h264_nvenc on an AMD-only box and then die inside avcodec_open2.
+#
+# The only honest check is to open the encoder. It also catches per-GPU limits a
+# name list never could: av1_nvenc is present in the build and fails on an
+# RTX 3090, because AV1 encode starts at Ada.
+#
+# 256x256 clears NVENC's minimum frame dimensions (it rejects 128x128). Probes
+# cost ~80 ms for NVENC and ~500 ms for QSV, so each answer is cached and only
+# hardware encoders are ever probed.
+# --------------------------------------------------------------------------- #
+_ENCODER_PROBE_CACHE: dict[str, bool] = {}
+_PROBE_SIZE = (256, 256)
+
+
+def _is_hardware_encoder(encoder: str) -> bool:
+    return encoder in _NVENC_CODECS or encoder in _QSV_CODECS
+
+
+def _encoder_available(nelux, encoder: str) -> bool:
+    """True if this machine can actually open `encoder`. Software encoders are
+    taken on trust; hardware encoders are probed once and remembered."""
+    if not _is_hardware_encoder(encoder):
+        return True
+    cached = _ENCODER_PROBE_CACHE.get(encoder)
+    if cached is not None:
+        return cached
+    width, height = _PROBE_SIZE
+    handle, probe_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(handle)
     try:
-        return {e.get("name") for e in nelux.get_nvenc_encoders()}
+        with nelux.VideoEncoder(probe_path, codec=encoder, width=width,
+                                height=height, fps=30.0):
+            pass
+        available = True
     except Exception:
-        return set()
+        available = False
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
+    _ENCODER_PROBE_CACHE[encoder] = available
+    return available
 
 
-def _resolve_encoder(nelux, codec: str) -> str:
-    """Map a codec choice to a concrete encoder name. Generic names ("auto",
-    "h264", "hevc", "av1") prefer NVENC and fall back to software when the
-    hardware encoder is absent. An explicit NVENC name with no NVENC present is
-    an error rather than a silent downgrade."""
+def _resolve_encoder(nelux, codec: str, engine: str = "auto") -> str:
+    """Map a (codec, engine) choice onto a concrete encoder name.
+
+    `codec` is either a family ("auto", "h264", "hevc", "av1") or an exact
+    encoder name ("h264_nvenc", "libx265", ...); an exact name wins outright and
+    makes `engine` irrelevant. For a family, an explicit `engine` is honoured as
+    written -- and raises if that engine cannot encode it here, rather than
+    silently downgrading -- while "auto" walks NVENC, then QSV, then the CPU."""
     name = (codec or "auto").strip().lower()
-    pair = _CODEC_FALLBACKS.get(name)
-    if pair is None:
-        if name in _NVENC_CODECS and name not in _available_nvenc(nelux):
+    engine_name = (engine or "auto").strip().lower()
+    family = _FAMILY_ALIASES.get(name)
+
+    if family is None:  # an exact encoder name
+        if engine_name != "auto":
+            _warn_once(
+                f"engine-ignored-{name}",
+                f"codec '{name}' names an exact encoder, so encoder_engine="
+                f"'{engine_name}' is ignored. Pick a codec family (auto/h264/"
+                f"hevc/av1) to choose the engine.",
+            )
+        if _is_hardware_encoder(name) and not _encoder_available(nelux, name):
             raise RuntimeError(
-                f"Nelux: {name} was requested but no NVENC encoder is available "
-                f"in this FFmpeg/driver combination. Use 'auto' to fall back to a "
-                f"software encoder."
+                f"Nelux: {name} was requested but this machine cannot open it "
+                f"(no such device, or the GPU does not support that codec -- "
+                f"av1_nvenc needs Ada or newer, for example). Use 'auto' to fall "
+                f"back to whatever is present."
             )
         return name
-    hardware, software = pair
-    return hardware if hardware in _available_nvenc(nelux) else software
+
+    by_engine = _ENCODER_TABLE[family]
+    if engine_name != "auto":
+        if engine_name not in by_engine:
+            raise RuntimeError(
+                f"Nelux: unknown encoder_engine '{engine_name}'. "
+                f"Expected one of {_ENGINES}."
+            )
+        encoder = by_engine[engine_name]
+        if not _encoder_available(nelux, encoder):
+            raise RuntimeError(
+                f"Nelux: encoder_engine='{engine_name}' cannot encode {family} "
+                f"on this machine ({encoder} failed to open). Use 'auto', or "
+                f"pick a different engine."
+            )
+        return encoder
+
+    for candidate_engine in _ENGINE_ORDER:
+        encoder = by_engine[candidate_engine]
+        if _encoder_available(nelux, encoder):
+            return encoder
+    return by_engine["cpu"]  # unreachable: software is never probed
 
 
 def _encoder_kwargs(nelux, codec: str, width: int, height: int, fps: float,
-                    preset, cq: int) -> dict:
-    encoder = _resolve_encoder(nelux, codec)
+                    preset, cq: int, engine: str = "auto") -> dict:
+    encoder = _resolve_encoder(nelux, codec, engine)
     kwargs = {
         "codec": encoder,
         "width": int(width),
         "height": int(height),
         "fps": float(fps),
-        "cq": int(cq),
     }
+    if encoder in _QSV_CODECS:
+        # nelux maps `cq` onto crf/qp for x26x, SVT-AV1, libaom and NVENC, but
+        # QSV matches none of those branches, so `cq` is accepted and silently
+        # dropped -- verified by encoding the same clip with and without it and
+        # getting byte-identical output. QSV's equivalent knob is the
+        # global_quality AVOption, which `options` forwards to avcodec_open2.
+        kwargs["options"] = {"global_quality": str(int(cq))}
+    else:
+        kwargs["cq"] = int(cq)
     resolved_preset = _resolve_preset(encoder, preset)
     if resolved_preset is not None:
         kwargs["preset"] = resolved_preset
@@ -364,6 +497,7 @@ def _transcode_nelux(
     codec: str = "auto",
     preset="auto",
     cq: int = 20,
+    encoder_engine: str = "auto",
     decode_accelerator: str = "cpu",
     start_time: float = 0.0,
     duration: float = 0.0,
@@ -391,7 +525,8 @@ def _transcode_nelux(
         copy_audio = bool(audio) and bool(reader.has_audio)
 
         kwargs = _encoder_kwargs(
-            nelux, codec, int(reader.width), int(reader.height), fps, preset, cq
+            nelux, codec, int(reader.width), int(reader.height), fps, preset, cq,
+            engine=encoder_engine,
         )
         with nelux.VideoEncoder(out_path, **kwargs) as enc:
             if copy_audio or subtitles:
@@ -472,6 +607,7 @@ def _nelux_encode(
     codec: str = "auto",
     preset="auto",
     cq: int = 20,
+    encoder_engine: str = "auto",
     passthrough_source: str | None = None,
     passthrough_subtitles: bool = False,
 ):
@@ -485,7 +621,8 @@ def _nelux_encode(
     _check_pcm_container(out_path, passthrough_source)
     nelux = _import_nelux()
     kwargs = _encoder_kwargs(
-        nelux, codec, int(images.shape[2]), int(images.shape[1]), fps, preset, cq
+        nelux, codec, int(images.shape[2]), int(images.shape[1]), fps, preset, cq,
+        engine=encoder_engine,
     )
     with nelux.VideoEncoder(out_path, **kwargs) as enc:
         if passthrough_source:
@@ -670,8 +807,14 @@ def _nelux_video_class():
 # --------------------------------------------------------------------------- #
 _VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv")
 _PRESETS = ["auto", "p1", "p2", "p3", "p4", "p5", "p6", "p7"]
+# Families first -- those pair with `encoder_engine` to pick the encoder. The
+# exact encoder names below still work and override the engine outright, which
+# also keeps workflows saved before `encoder_engine` existed loading unchanged.
 _CODECS = [
-    "auto", "h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264", "libx265", "libsvtav1",
+    "auto", "h264", "hevc", "av1",
+    "h264_nvenc", "hevc_nvenc", "av1_nvenc",
+    "h264_qsv", "hevc_qsv", "av1_qsv",
+    "libx264", "libx265", "libsvtav1",
 ]
 
 
@@ -761,6 +904,7 @@ class NeluxSaveVideo:
                 "video": ("VIDEO",),
                 "filename_prefix": ("STRING", {"default": "nelux/video"}),
                 "codec": (_CODECS,),
+                "encoder_engine": (_ENGINES,),
                 "container": (["mp4", "mkv", "mov"],),
                 "preset": (_PRESETS,),
                 "cq": ("INT", {"default": 20, "min": 0, "max": 51}),
@@ -774,7 +918,8 @@ class NeluxSaveVideo:
     CATEGORY = "Nelux"
     OUTPUT_NODE = True
 
-    def save(self, video, filename_prefix, codec, container, preset, cq, audio):
+    def save(self, video, filename_prefix, codec, encoder_engine, container,
+             preset, cq, audio):
         folder_paths = _folder_paths()
         full_output_folder, filename, counter, subfolder, _ = (
             folder_paths.get_save_image_path(
@@ -790,7 +935,7 @@ class NeluxSaveVideo:
         if isinstance(video, _nelux_video_class()):
             _transcode_nelux(
                 video.get_stream_source(), out_path,
-                codec=codec, preset=preset, cq=cq,
+                codec=codec, preset=preset, cq=cq, encoder_engine=encoder_engine,
                 decode_accelerator=video._accel,
                 start_time=video._start_time, duration=video._duration,
                 audio=audio, subtitles=False,
@@ -817,7 +962,7 @@ class NeluxSaveVideo:
         try:
             _nelux_encode(
                 images, fps, out_path,
-                codec=codec, preset=preset, cq=cq,
+                codec=codec, preset=preset, cq=cq, encoder_engine=encoder_engine,
                 passthrough_source=passthrough_source,
             )
         finally:
@@ -979,6 +1124,7 @@ class NeluxEncodeFrames:
                 "output_path": ("STRING", {"default": "nelux_comfy_output.mp4"}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0}),
                 "codec": (_CODECS,),
+                "encoder_engine": (_ENGINES,),
                 "preset": (_PRESETS,),
                 "cq": ("INT", {"default": 20, "min": 0, "max": 51}),
             }
@@ -990,9 +1136,10 @@ class NeluxEncodeFrames:
     CATEGORY = "Nelux"
     OUTPUT_NODE = True
 
-    def encode(self, images, output_path, fps, codec, preset, cq):
+    def encode(self, images, output_path, fps, codec, encoder_engine, preset, cq):
         path = _resolve_output_path(output_path)
-        _nelux_encode(images, fps, path, codec=codec, preset=preset, cq=cq)
+        _nelux_encode(images, fps, path, codec=codec, preset=preset, cq=cq,
+                      encoder_engine=encoder_engine)
         return (path,)
 
 

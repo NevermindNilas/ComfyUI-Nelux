@@ -27,17 +27,37 @@ def _load_nodes():
 
 
 class _FakeNelux:
-    """Stands in for the nelux module in encoder-resolution tests."""
+    """Stands in for the nelux module in encoder-resolution tests.
 
-    def __init__(self, nvenc=()):
-        self._nvenc = nvenc
+    Availability is decided the way the real code decides it -- by trying to
+    open a VideoEncoder -- so `working` is the set of encoders this fake machine
+    can actually run."""
 
-    def get_nvenc_encoders(self):
-        return [{"name": n} for n in self._nvenc]
+    def __init__(self, working=()):
+        self.working = set(working)
+        self.probed = []
+
+    def VideoEncoder(self, path, codec=None, **kwargs):
+        self.probed.append(codec)
+        if codec not in self.working:
+            raise RuntimeError(f"Failed to open video codec: {codec}")
+        return contextlib.nullcontext()
 
 
-_WITH_NVENC = _FakeNelux(("h264_nvenc", "hevc_nvenc", "av1_nvenc"))
-_NO_NVENC = _FakeNelux(())
+_NVENC_ONLY = ("h264_nvenc", "hevc_nvenc", "av1_nvenc")
+_QSV_ONLY = ("h264_qsv", "hevc_qsv", "av1_qsv")
+
+
+@pytest.fixture
+def encoders():
+    """Factory for a fake machine. Each call re-execs the node module so the
+    probe cache starts empty -- one machine's answers must not leak into the
+    next one's."""
+
+    def build(*working):
+        return _load_nodes(), _FakeNelux(working)
+
+    return build
 
 
 @pytest.fixture
@@ -198,45 +218,136 @@ def test_preset_dropped_for_encoders_with_no_known_ladder():
 
 # --------------------------------------------------------------------------- #
 # Encoder resolution
+#
+# Availability must come from actually opening the encoder: nelux's
+# get_nvenc_encoders() only reports what FFmpeg was compiled with, and this
+# FFmpeg build lists NVENC/QSV/AMF/VAAPI encoders on every platform.
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
-    "codec,with_nvenc,without_nvenc",
+    "codec,nvenc_box,qsv_box,cpu_box",
     [
-        ("auto", "h264_nvenc", "libx264"),
-        ("h264", "h264_nvenc", "libx264"),
-        ("hevc", "hevc_nvenc", "libx265"),
-        ("h265", "hevc_nvenc", "libx265"),
-        ("av1", "av1_nvenc", "libsvtav1"),
+        ("auto", "h264_nvenc", "h264_qsv", "libx264"),
+        ("h264", "h264_nvenc", "h264_qsv", "libx264"),
+        ("hevc", "hevc_nvenc", "hevc_qsv", "libx265"),
+        ("h265", "hevc_nvenc", "hevc_qsv", "libx265"),
+        ("av1", "av1_nvenc", "av1_qsv", "libsvtav1"),
     ],
 )
-def test_generic_codec_falls_back_to_software(codec, with_nvenc, without_nvenc):
-    nodes = _load_nodes()
-    assert nodes._resolve_encoder(_WITH_NVENC, codec) == with_nvenc
-    assert nodes._resolve_encoder(_NO_NVENC, codec) == without_nvenc
+def test_auto_engine_prefers_nvenc_then_qsv_then_cpu(
+    encoders, codec, nvenc_box, qsv_box, cpu_box
+):
+    nodes, nvidia = encoders(*_NVENC_ONLY, *_QSV_ONLY)
+    assert nodes._resolve_encoder(nvidia, codec) == nvenc_box
+
+    nodes, intel = encoders(*_QSV_ONLY)
+    assert nodes._resolve_encoder(intel, codec) == qsv_box
+
+    nodes, bare = encoders()
+    assert nodes._resolve_encoder(bare, codec) == cpu_box
 
 
-def test_explicit_encoder_name_is_honored():
-    nodes = _load_nodes()
-    assert nodes._resolve_encoder(_WITH_NVENC, "libx264") == "libx264"
-    assert nodes._resolve_encoder(_WITH_NVENC, "hevc_nvenc") == "hevc_nvenc"
+@pytest.mark.parametrize(
+    "engine,expected",
+    [("nvenc", "h264_nvenc"), ("qsv", "h264_qsv"), ("cpu", "libx264")],
+)
+def test_explicit_engine_is_honoured(encoders, engine, expected):
+    nodes, machine = encoders(*_NVENC_ONLY, *_QSV_ONLY)
+    assert nodes._resolve_encoder(machine, "h264", engine) == expected
 
 
-def test_explicit_nvenc_without_hardware_raises_rather_than_downgrading():
-    nodes = _load_nodes()
-    with pytest.raises(RuntimeError, match="no NVENC encoder is available"):
-        nodes._resolve_encoder(_NO_NVENC, "h264_nvenc")
+def test_explicit_engine_raises_rather_than_downgrading(encoders):
+    # Asking for QSV on a machine with none must not quietly hand back libx264.
+    nodes, nvidia = encoders(*_NVENC_ONLY)
+    with pytest.raises(RuntimeError, match="cannot encode h264"):
+        nodes._resolve_encoder(nvidia, "h264", "qsv")
 
 
-def test_encoder_kwargs_omit_preset_when_auto():
-    nodes = _load_nodes()
-    kwargs = nodes._encoder_kwargs(_NO_NVENC, "auto", 64, 32, 24.0, "auto", 20)
+def test_unknown_engine_is_rejected(encoders):
+    nodes, machine = encoders(*_NVENC_ONLY)
+    with pytest.raises(RuntimeError, match="unknown encoder_engine"):
+        nodes._resolve_encoder(machine, "h264", "vaapi")
+
+
+def test_cpu_engine_never_probes_hardware(encoders):
+    nodes, machine = encoders()
+    assert nodes._resolve_encoder(machine, "hevc", "cpu") == "libx265"
+    assert machine.probed == []
+
+
+def test_exact_encoder_name_wins_over_the_engine(encoders):
+    nodes, machine = encoders(*_NVENC_ONLY, *_QSV_ONLY)
+    assert nodes._resolve_encoder(machine, "libx264", "nvenc") == "libx264"
+    assert nodes._resolve_encoder(machine, "hevc_qsv", "nvenc") == "hevc_qsv"
+
+
+def test_exact_hardware_name_without_the_hardware_raises(encoders):
+    # av1_nvenc is in every FFmpeg build but needs Ada or newer -- it fails to
+    # open on, say, an RTX 3090, and a build-time name list cannot tell.
+    nodes, ampere = encoders("h264_nvenc", "hevc_nvenc")
+    with pytest.raises(RuntimeError, match="cannot open it"):
+        nodes._resolve_encoder(ampere, "av1_nvenc")
+
+
+def test_auto_engine_skips_a_codec_the_gpu_cannot_do(encoders):
+    # Same Ampere box: h264 goes to NVENC, but av1 has to fall past it.
+    nodes, ampere = encoders("h264_nvenc", "hevc_nvenc")
+    assert nodes._resolve_encoder(ampere, "h264") == "h264_nvenc"
+    assert nodes._resolve_encoder(ampere, "av1") == "libsvtav1"
+
+
+def test_each_encoder_is_probed_only_once(encoders):
+    nodes, machine = encoders(*_NVENC_ONLY)
+    for _ in range(5):
+        nodes._resolve_encoder(machine, "h264")
+    assert machine.probed == ["h264_nvenc"]
+
+
+def test_encoder_kwargs_omit_preset_when_auto(encoders):
+    nodes, bare = encoders()
+    kwargs = nodes._encoder_kwargs(bare, "auto", 64, 32, 24.0, "auto", 20)
     assert kwargs == {"codec": "libx264", "width": 64, "height": 32, "fps": 24.0, "cq": 20}
 
 
-def test_encoder_kwargs_translate_preset_for_the_resolved_encoder():
+def test_encoder_kwargs_translate_preset_for_the_resolved_encoder(encoders):
+    nodes, bare = encoders()
+    nodes_hw, nvidia = encoders(*_NVENC_ONLY)
+    assert nodes._encoder_kwargs(bare, "auto", 64, 32, 24.0, "p4", 20)["preset"] == "medium"
+    assert nodes_hw._encoder_kwargs(nvidia, "auto", 64, 32, 24.0, "p4", 20)["preset"] == "p4"
+
+
+# --------------------------------------------------------------------------- #
+# QSV quality and presets
+#
+# nelux maps `cq` onto crf/qp for x26x, SVT-AV1, libaom and NVENC, but QSV
+# matches none of those branches, so passing `cq` there is silently dropped --
+# encoding the same clip with and without it gives byte-identical output.
+# --------------------------------------------------------------------------- #
+def test_qsv_quality_goes_through_global_quality(encoders):
+    nodes, intel = encoders(*_QSV_ONLY)
+
+    kwargs = nodes._encoder_kwargs(intel, "h264", 64, 32, 24.0, "auto", 23, engine="qsv")
+
+    assert kwargs["codec"] == "h264_qsv"
+    assert kwargs["options"] == {"global_quality": "23"}
+    assert "cq" not in kwargs  # nelux would drop it on the floor
+
+
+def test_non_qsv_encoders_still_use_cq(encoders):
+    nodes, nvidia = encoders(*_NVENC_ONLY)
+    kwargs = nodes._encoder_kwargs(nvidia, "h264", 64, 32, 24.0, "auto", 23, engine="nvenc")
+    assert kwargs["cq"] == 23
+    assert "options" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "preset,expected",
+    [("p1", "veryfast"), ("p4", "medium"), ("p7", "veryslow"), ("medium", "medium")],
+)
+def test_qsv_preset_ladder(preset, expected):
+    # QSV has no ultrafast/superfast rung, so its ladder is one step slower than
+    # x264's at the fast end.
     nodes = _load_nodes()
-    assert nodes._encoder_kwargs(_NO_NVENC, "auto", 64, 32, 24.0, "p4", 20)["preset"] == "medium"
-    assert nodes._encoder_kwargs(_WITH_NVENC, "auto", 64, 32, 24.0, "p4", 20)["preset"] == "p4"
+    assert nodes._resolve_preset("h264_qsv", preset) == expected
 
 
 # --------------------------------------------------------------------------- #
@@ -436,13 +547,49 @@ def test_auto_accelerator_probes_once_per_codec(accel_nodes, monkeypatch):
 
 
 @pytest.mark.parametrize("choice", ["nvdec", "qsv", "cpu"])
-def test_explicit_accelerator_is_passed_through_unprobed(accel_nodes, monkeypatch, choice):
-    # An explicit request must reach nelux so it raises instead of downgrading.
-    fake = _FakeReaderNelux(())
+def test_explicit_accelerator_is_honoured(accel_nodes, monkeypatch, choice):
+    # An explicit request is never downgraded to something else.
+    fake = _FakeReaderNelux(("nvdec", "qsv", "cpu"))
     monkeypatch.setattr(accel_nodes, "_import_nelux", lambda: fake)
 
     assert accel_nodes._resolve_accelerator("clip.mp4", choice) == choice
+
+
+def test_explicit_cpu_is_never_probed(accel_nodes, monkeypatch):
+    fake = _FakeReaderNelux(())
+    monkeypatch.setattr(accel_nodes, "_import_nelux", lambda: fake)
+
+    assert accel_nodes._resolve_accelerator("clip.mp4", "cpu") == "cpu"
     assert fake.opened == []
+
+
+@pytest.mark.parametrize("choice", ["nvdec", "qsv"])
+def test_explicit_hardware_accelerator_raises_rather_than_downgrading(
+    accel_nodes, monkeypatch, choice
+):
+    # nelux's own message for an unsupported backend is "Unknown
+    # decode_accelerator: qsv" -- true but unhelpful, since it does not say
+    # whether the build or the machine is at fault.
+    monkeypatch.setattr(accel_nodes, "_import_nelux", lambda: _FakeReaderNelux(("cpu",)))
+
+    with pytest.raises(RuntimeError, match="cannot decode this file"):
+        accel_nodes._resolve_accelerator("clip.mp4", choice)
+
+
+def test_accelerator_probe_matches_how_the_nodes_decode(accel_nodes, monkeypatch):
+    # force_8bit changes which pixel formats a backend must handle, so probing
+    # without it could bless a backend that then fails on the real open.
+    seen = {}
+
+    class _Recorder(_FakeReaderNelux):
+        def VideoReader(self, path, decode_accelerator="cpu", **kwargs):
+            seen[decode_accelerator] = kwargs
+            return super().VideoReader(path, decode_accelerator, **kwargs)
+
+    monkeypatch.setattr(accel_nodes, "_import_nelux", lambda: _Recorder(("nvdec",)))
+    accel_nodes._resolve_accelerator("clip.mp4", "auto")
+
+    assert seen["nvdec"].get("force_8bit") is True
 
 
 def test_auto_is_the_default_accelerator_in_every_node():
