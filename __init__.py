@@ -712,7 +712,7 @@ def _collect_comfy_images_cpu(source, expected_count: int = 0) -> torch.Tensor |
         else:
             overflow = [img.cpu() if img.device.type != "cpu" else img]
             idx += 1
-        del img
+        del img, frame
 
     if idx == 0:
         return None
@@ -843,6 +843,77 @@ def _write_waveform_wav(audio: dict, wav_path: str) -> bool:
         w.setframerate(sample_rate)
         w.writeframes(pcm.numpy().tobytes())
     return True
+
+
+_AAC_SAMPLE_RATES = (
+    96000, 88200, 64000, 48000, 44100, 32000,
+    24000, 22050, 16000, 12000, 11025, 8000, 7350,
+)
+
+
+def _write_waveform_aac(audio: dict, m4a_path: str, bit_rate: int = 192000) -> bool:
+    """Encode a Comfy AUDIO dict ({"waveform": [B,C,T], "sample_rate": int}) to
+    an AAC .m4a file via PyAV so it can be stream-copied cleanly into .mp4 via
+    nelux's add_passthrough. Returns True if audio was written."""
+    if not audio:
+        return False
+    waveform = audio.get("waveform")
+    sample_rate = int(audio.get("sample_rate", 0))
+    if waveform is None or sample_rate <= 0 or waveform.numel() == 0:
+        return False
+
+    import av
+    from av.audio.resampler import AudioResampler
+
+    wf = waveform
+    if wf.ndim == 3:  # [B, C, T] -> take first item
+        wf = wf[0]
+    if wf.ndim == 1:  # [T] -> [1, T]
+        wf = wf.unsqueeze(0)
+    channels = int(wf.shape[0])
+    if channels == 1:
+        layout = "mono"
+    elif channels == 2:
+        layout = "stereo"
+    elif channels == 6:
+        layout = "5.1"
+    else:
+        wf = wf[:2]
+        channels = int(wf.shape[0])
+        layout = "stereo" if channels == 2 else "mono"
+
+    samples = wf.clamp(-1.0, 1.0).to(torch.float32).cpu().contiguous().numpy()
+    target_rate = (
+        sample_rate
+        if sample_rate in _AAC_SAMPLE_RATES
+        else min(_AAC_SAMPLE_RATES, key=lambda r: abs(r - sample_rate))
+    )
+
+    with av.open(m4a_path, mode="w", format="mp4") as container:
+        stream = container.add_stream("aac", rate=target_rate)
+        stream.layout = layout
+        stream.bit_rate = bit_rate if channels >= 2 else min(bit_rate, 128000)
+
+        resampler = AudioResampler(format="fltp", layout=layout, rate=target_rate)
+        frame_size = stream.codec_context.frame_size or 1024
+        chunk_samples = max(frame_size * 16, 16384)
+        total = samples.shape[1]
+
+        for offset in range(0, total, chunk_samples):
+            chunk = samples[:, offset:offset + chunk_samples]
+            frame = av.AudioFrame.from_ndarray(chunk, format="fltp", layout=layout)
+            frame.sample_rate = sample_rate
+            for resampled in resampler.resample(frame):
+                for packet in stream.encode(resampled):
+                    container.mux(packet)
+
+        for resampled in resampler.resample(None):
+            for packet in stream.encode(resampled):
+                container.mux(packet)
+        for packet in stream.encode(None):
+            container.mux(packet)
+
+    return os.path.isfile(m4a_path) and os.path.getsize(m4a_path) > 0
 
 
 # FFmpeg's mp4 muxer accepts a pcm_s16le stream and then writes a zero-length
@@ -1218,29 +1289,40 @@ class NeluxSaveVideo:
         images = components.images
         fps = float(components.frame_rate)
 
-        temp_wav = None
+        temp_audio = None
         passthrough_source = None
-        if audio and getattr(components, "audio", None):
-            # This VIDEO carries an audio *tensor*, not a compressed stream, so
-            # it can only be muxed as raw PCM. Fail before encoding anything.
-            error = _pcm_container_error(out_path)
-            if error:
-                raise ValueError(error)
-            handle, temp_wav = tempfile.mkstemp(suffix=".wav")
-            os.close(handle)
-            if _write_waveform_wav(components.audio, temp_wav):
-                passthrough_source = temp_wav
-
         try:
+            if audio and getattr(components, "audio", None):
+                # Component-backed VIDEO carries an audio tensor rather than a
+                # compressed stream. Containers that reject raw PCM (e.g. .mp4)
+                # encode the waveform to AAC (.m4a) via PyAV so nelux can
+                # stream-copy a standard AAC track cleanly into the container.
+                error = _pcm_container_error(out_path)
+                if error:
+                    handle, temp_audio = tempfile.mkstemp(suffix=".m4a")
+                    os.close(handle)
+                    try:
+                        if _write_waveform_aac(components.audio, temp_audio):
+                            passthrough_source = temp_audio
+                    except ImportError as exc:
+                        raise ValueError(
+                            f"{error} (Also failed to encode AAC fallback: PyAV is not installed.)"
+                        ) from exc
+                else:
+                    handle, temp_audio = tempfile.mkstemp(suffix=".wav")
+                    os.close(handle)
+                    if _write_waveform_wav(components.audio, temp_audio):
+                        passthrough_source = temp_audio
+
             _nelux_encode(
                 images, fps, out_path,
                 codec=codec, preset=preset, cq=cq, encoder_engine=encoder_engine,
                 passthrough_source=passthrough_source,
             )
         finally:
-            if temp_wav and os.path.isfile(temp_wav):
+            if temp_audio and os.path.isfile(temp_audio):
                 try:
-                    os.remove(temp_wav)
+                    os.remove(temp_audio)
                 except OSError:
                     pass
 
