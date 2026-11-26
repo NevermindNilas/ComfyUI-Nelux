@@ -962,3 +962,263 @@ def test_comfy_codec_name_unwraps_enum_values():
     assert nodes._comfy_codec_name(_Codec()) == "h264"
     assert nodes._comfy_codec_name(None) == "auto"
     assert nodes._comfy_codec_name("AV1") == "av1"
+
+
+# --------------------------------------------------------------------------- #
+# Streaming CPU frame collection (prevents VRAM OOM during NVDEC decode)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("expected_count", [0, 3, 5, 8, 20])
+def test_collect_comfy_images_cpu_handles_exact_under_over_and_unknown_counts(
+    expected_count,
+):
+    nodes = _load_nodes()
+    source = (torch.full((4, 6, 3), i, dtype=torch.uint8) for i in range(5))
+
+    images = nodes._collect_comfy_images_cpu(source, expected_count=expected_count)
+
+    assert images.shape == (5, 4, 6, 3)
+    assert images.dtype == torch.float32
+    assert images.device.type == "cpu"
+    for i in range(5):
+        assert torch.allclose(images[i], torch.full((4, 6, 3), i / 255.0))
+
+
+def test_collect_comfy_images_cpu_returns_none_for_empty_source():
+    nodes = _load_nodes()
+    assert nodes._collect_comfy_images_cpu(iter(()), expected_count=10) is None
+    assert nodes._collect_comfy_images_cpu(iter(()), expected_count=0) is None
+
+
+def test_collect_comfy_images_cpu_does_not_retain_previous_frames():
+    import weakref
+
+    nodes = _load_nodes()
+    refs = []
+    alive_at_yield = []
+
+    def source():
+        for i in range(5):
+            alive_at_yield.append(sum(1 for r in refs if r() is not None))
+            frame = torch.full((4, 4, 3), i, dtype=torch.uint8)
+            refs.append(weakref.ref(frame))
+            yield frame
+            del frame
+
+    images = nodes._collect_comfy_images_cpu(source(), expected_count=5)
+
+    assert images.shape == (5, 4, 4, 3)
+    # Each frame is copied into the CPU buffer and released before the next is read.
+    assert max(alive_at_yield) == 0
+
+
+def test_decode_frames_nelux_streams_into_cpu_tensor(monkeypatch):
+    nodes = _load_nodes()
+
+    class _FakeVideoReader:
+        def __init__(self, path, **kwargs):
+            self.fps = 30.0
+            self.width = 4
+            self.height = 2
+            self.total_frames = 4
+            self._range = (0, 4)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def set_range(self, start, end):
+            self._range = (start, end)
+
+        def __iter__(self):
+            for i in range(*self._range):
+                yield torch.full((self.height, self.width, 3), i * 10, dtype=torch.uint8)
+
+    fake_nelux = types.SimpleNamespace(VideoReader=_FakeVideoReader)
+    monkeypatch.setattr(nodes, "_import_nelux", lambda: fake_nelux)
+    monkeypatch.setattr(nodes, "_resolve_accelerator", lambda path, choice: "cpu")
+
+    images, fps, width, height = nodes._decode_frames_nelux("clip.mp4", "auto")
+
+    assert (fps, width, height) == (30.0, 4, 2)
+    assert images.shape == (4, 2, 4, 3)
+    assert images.device.type == "cpu"
+    assert torch.allclose(images[3], torch.full((2, 4, 3), 30.0 / 255.0))
+
+
+def test_load_frames_cpu_streams_strided_frames(monkeypatch):
+    nodes = _load_nodes()
+
+    class _FakeVideoReader:
+        def __init__(self, path, **kwargs):
+            self.fps = 24.0
+            self.width = 2
+            self.height = 2
+            self.total_frames = 10
+            self._range = (0, 10)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def set_range(self, start, end):
+            self._range = (start, end)
+
+        def __iter__(self):
+            for i in range(*self._range):
+                yield torch.full((2, 2, 3), i, dtype=torch.uint8)
+
+    fake_nelux = types.SimpleNamespace(VideoReader=_FakeVideoReader)
+    monkeypatch.setattr(nodes, "_import_nelux", lambda: fake_nelux)
+    monkeypatch.setattr(nodes, "_resolve_accelerator", lambda path, choice: "cpu")
+
+    images, fps, width, height = nodes.NeluxLoadFrames().load(
+        "clip.mp4", start_frame=1, frame_count=3, step=2,
+        decode_accelerator="auto", output_device="cpu",
+        resize_width=0, resize_height=0,
+    )
+
+    assert (fps, width, height) == (24.0, 2, 2)
+    assert images.shape == (3, 2, 2, 3)
+    assert images.device.type == "cpu"
+    # Sampled frames: 1, 3, 5.
+    assert torch.allclose(images[0], torch.full((2, 2, 3), 1.0 / 255.0))
+    assert torch.allclose(images[1], torch.full((2, 2, 3), 3.0 / 255.0))
+    assert torch.allclose(images[2], torch.full((2, 2, 3), 5.0 / 255.0))
+
+
+# --------------------------------------------------------------------------- #
+# Component-backed audio AAC encoding for MP4
+# --------------------------------------------------------------------------- #
+def test_write_waveform_aac_empty_is_noop(tmp_path):
+    nodes = _load_nodes()
+    out = str(tmp_path / "x.m4a")
+    assert nodes._write_waveform_aac(None, out) is False
+    assert nodes._write_waveform_aac({}, out) is False
+    assert nodes._write_waveform_aac({"waveform": torch.zeros(1, 2, 0), "sample_rate": 44100}, out) is False
+    assert nodes._write_waveform_aac({"waveform": torch.zeros(1, 2, 100), "sample_rate": 0}, out) is False
+
+
+def _stub_save_env(nodes, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        nodes, "_folder_paths",
+        lambda: types.SimpleNamespace(
+            get_output_directory=lambda: str(tmp_path),
+            get_save_image_path=lambda prefix, out: (str(tmp_path), "clip", 1, "", prefix),
+        ),
+    )
+    monkeypatch.setattr(nodes, "_nelux_video_class", lambda: type("_DummyNeluxVideo", (), {}))
+
+
+def _fake_component_video():
+    audio = {"waveform": torch.zeros(1, 2, 1024), "sample_rate": 44100}
+    components = types.SimpleNamespace(
+        images=torch.zeros(2, 8, 8, 3),
+        frame_rate=24.0,
+        audio=audio,
+    )
+    return types.SimpleNamespace(get_components=lambda: components)
+
+
+def test_save_video_encodes_component_audio_to_aac_for_mp4(monkeypatch, tmp_path):
+    nodes = _load_nodes()
+    _stub_save_env(nodes, monkeypatch, tmp_path)
+
+    aac_paths = []
+    encode_calls = []
+
+    def fake_write_aac(audio, path):
+        aac_paths.append(path)
+        Path(path).write_bytes(b"fake-m4a")
+        return True
+
+    def fake_encode(images, fps, out_path, **kwargs):
+        encode_calls.append((out_path, kwargs["passthrough_source"]))
+        return out_path
+
+    monkeypatch.setattr(nodes, "_write_waveform_aac", fake_write_aac)
+    monkeypatch.setattr(nodes, "_nelux_encode", fake_encode)
+
+    nodes.NeluxSaveVideo().save(
+        _fake_component_video(), "out/clip", "auto", "auto", "mp4", "auto", 20, True
+    )
+
+    assert len(aac_paths) == 1
+    assert aac_paths[0].endswith(".m4a")
+    assert encode_calls == [(str(tmp_path / "clip_00001.mp4"), aac_paths[0])]
+    assert not Path(aac_paths[0]).exists()  # temp file cleaned up
+
+
+def test_save_video_raises_for_mp4_when_pyav_is_missing(monkeypatch, tmp_path):
+    nodes = _load_nodes()
+    _stub_save_env(nodes, monkeypatch, tmp_path)
+
+    seen_paths = []
+
+    def missing_pyav(audio, path):
+        seen_paths.append(path)
+        raise ImportError("No module named 'av'")
+
+    monkeypatch.setattr(nodes, "_write_waveform_aac", missing_pyav)
+
+    with pytest.raises(ValueError, match="PyAV is not installed"):
+        nodes.NeluxSaveVideo().save(
+            _fake_component_video(), "out/clip", "auto", "auto", "mp4", "auto", 20, True
+        )
+
+    assert len(seen_paths) == 1
+    assert not Path(seen_paths[0]).exists()  # temp file cleaned up even on error
+
+
+def test_save_video_keeps_wav_passthrough_for_mkv(monkeypatch, tmp_path):
+    nodes = _load_nodes()
+    _stub_save_env(nodes, monkeypatch, tmp_path)
+
+    wav_paths = []
+    encode_calls = []
+
+    def fake_write_wav(audio, path):
+        wav_paths.append(path)
+        Path(path).write_bytes(b"fake-wav")
+        return True
+
+    def fake_encode(images, fps, out_path, **kwargs):
+        encode_calls.append((out_path, kwargs["passthrough_source"]))
+        return out_path
+
+    monkeypatch.setattr(nodes, "_write_waveform_wav", fake_write_wav)
+    monkeypatch.setattr(nodes, "_write_waveform_aac", lambda *a, **kw: pytest.fail("should use WAV for mkv"))
+    monkeypatch.setattr(nodes, "_nelux_encode", fake_encode)
+
+    nodes.NeluxSaveVideo().save(
+        _fake_component_video(), "out/clip", "auto", "auto", "mkv", "auto", 20, True
+    )
+
+    assert len(wav_paths) == 1
+    assert wav_paths[0].endswith(".wav")
+    assert encode_calls == [(str(tmp_path / "clip_00001.mkv"), wav_paths[0])]
+    assert not Path(wav_paths[0]).exists()
+
+
+@pytest.mark.skipif(importlib.util.find_spec("av") is None, reason="PyAV not installed")
+@pytest.mark.parametrize("channels,sample_rate", [(2, 44100), (1, 48000), (2, 36000)])
+def test_write_waveform_aac_roundtrip(tmp_path, channels, sample_rate):
+    import av
+
+    nodes = _load_nodes()
+    t = torch.linspace(-0.5, 0.5, steps=sample_rate // 4)
+    waveform = torch.stack([t * (1 if c % 2 == 0 else -1) for c in range(channels)]).unsqueeze(0)
+    m4a_path = tmp_path / f"out_{channels}_{sample_rate}.m4a"
+
+    assert nodes._write_waveform_aac({"waveform": waveform, "sample_rate": sample_rate}, str(m4a_path)) is True
+
+    with av.open(str(m4a_path)) as container:
+        assert len(container.streams.audio) == 1
+        stream = container.streams.audio[0]
+        assert stream.codec_context.name == "aac"
+        assert stream.channels == channels
+        decoded_samples = sum(frame.samples for frame in container.decode(audio=0))
+        assert decoded_samples > 0

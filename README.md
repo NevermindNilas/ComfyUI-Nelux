@@ -279,10 +279,11 @@ AVOption instead, so `cq` behaves consistently across all three engines.
   audio stream is copied into the output losslessly via nelux `add_passthrough` —
   e.g. `aac` stays `aac`. Works in every container.
 - **Component-backed video** (Create Video with an `AUDIO` input): the audio is a
-  raw tensor, so it can only be muxed as PCM. Choose the **mkv** or **mov**
-  container. Selecting **mp4** raises: FFmpeg's mp4 muxer accepts a `pcm_s16le`
-  stream, writes a zero-length `stsd` entry, and reports success — the resulting
-  file cannot be demuxed at all (`invalid size 0 in stsd`).
+  raw tensor. In **mkv** and **mov** it is muxed losslessly as `pcm_s16le`. In
+  **mp4** (where FFmpeg's muxer would silently corrupt raw PCM with a
+  zero-length `stsd` entry), Nelux Save Video encodes the waveform to **AAC**
+  via PyAV and stream-copies it cleanly into the MP4 (if PyAV is not installed,
+  saving component audio to `.mp4` still raises an actionable error).
 
 ## Known limitations
 
