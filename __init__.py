@@ -680,6 +680,51 @@ def _frame_range(fps: float, total_frames: int, start_time: float, duration: flo
     return start_f, max(end_f, start_f + 1)
 
 
+def _collect_comfy_images_cpu(source, expected_count: int = 0) -> torch.Tensor | None:
+    """Materialize decoded frames directly into a single contiguous float32
+    [B,H,W,3] CPU tensor without accumulating frames in GPU VRAM.
+
+    Each frame is converted and copied to host immediately, keeping peak GPU
+    VRAM to ~1 frame instead of 2x the full video (frame list + torch.stack),
+    and preallocating the host tensor when `expected_count` is known avoids
+    doubling host RAM during torch.stack().
+    """
+    out = None
+    overflow = None
+    idx = 0
+
+    for frame in source:
+        img = _to_comfy_image(frame)
+        if out is None and overflow is None:
+            if expected_count > 0:
+                out = torch.empty((expected_count, *img.shape), dtype=torch.float32)
+                out[0].copy_(img)
+                idx = 1
+            else:
+                overflow = [img.cpu() if img.device.type != "cpu" else img]
+                idx = 1
+        elif overflow is not None:
+            overflow.append(img.cpu() if img.device.type != "cpu" else img)
+            idx += 1
+        elif idx < out.shape[0]:
+            out[idx].copy_(img)
+            idx += 1
+        else:
+            overflow = [img.cpu() if img.device.type != "cpu" else img]
+            idx += 1
+        del img
+
+    if idx == 0:
+        return None
+    if out is None:
+        return torch.stack(overflow)
+    if overflow is not None:
+        return torch.cat([out, torch.stack(overflow)], dim=0)
+    if idx < out.shape[0]:
+        return out[:idx].clone() if idx < out.shape[0] // 2 else out[:idx]
+    return out
+
+
 def _decode_frames_nelux(
     path: str,
     decode_accelerator: str = "cpu",
@@ -702,17 +747,19 @@ def _decode_frames_nelux(
     ) as reader:
         fps = float(reader.fps)
         width, height = int(reader.width), int(reader.height)
+        total_frames = int(reader.total_frames)
         if start_time or duration:
             start_f, end_f = _frame_range(
-                fps, int(reader.total_frames), start_time, duration
+                fps, total_frames, start_time, duration
             )
+            expected_count = max(0, end_f - start_f) if total_frames > 0 or duration else 0
             source = _iter_range(reader, start_f, end_f, accelerator)
         else:
+            expected_count = max(0, total_frames)
             source = reader
-        frames = [_to_comfy_image(f) for f in source]
-    if not frames:
+        images = _collect_comfy_images_cpu(source, expected_count=expected_count)
+    if images is None:
         raise RuntimeError(f"Nelux decoded no frames from {path}")
-    images = torch.stack(frames).cpu()
     return images, fps, width, height
 
 
@@ -1329,16 +1376,24 @@ class NeluxLoadFrames:
             # FIXED UPSTREAM in Nelux#62, but kept for the same reason as #57
             # above: not in a published wheel, and the version string cannot
             # distinguish a fixed build from a broken one.
-            frames = [
-                _to_comfy_image(frame)
-                for i, frame in enumerate(_iter_range(reader, start, end, accelerator))
-                if i % step == 0
-            ][:count]
-            if not frames:
-                raise RuntimeError(f"Nelux decoded no frames from {input_path}")
-            images = torch.stack(frames)
+            def _sampled_frames():
+                taken = 0
+                for i, frame in enumerate(_iter_range(reader, start, end, accelerator)):
+                    if i % step == 0:
+                        yield frame
+                        taken += 1
+                        if taken >= count:
+                            break
+
             if output_device == "cpu":
-                images = images.cpu()
+                images = _collect_comfy_images_cpu(_sampled_frames(), expected_count=count)
+                if images is None:
+                    raise RuntimeError(f"Nelux decoded no frames from {input_path}")
+            else:
+                frames = [_to_comfy_image(frame) for frame in _sampled_frames()]
+                if not frames:
+                    raise RuntimeError(f"Nelux decoded no frames from {input_path}")
+                images = torch.stack(frames)
             return images, float(reader.fps), int(reader.width), int(reader.height)
 
 

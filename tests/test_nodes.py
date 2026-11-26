@@ -962,3 +962,128 @@ def test_comfy_codec_name_unwraps_enum_values():
     assert nodes._comfy_codec_name(_Codec()) == "h264"
     assert nodes._comfy_codec_name(None) == "auto"
     assert nodes._comfy_codec_name("AV1") == "av1"
+
+
+# --------------------------------------------------------------------------- #
+# Streaming CPU frame collection (prevents VRAM OOM during NVDEC decode)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("expected_count", [0, 3, 5, 8, 20])
+def test_collect_comfy_images_cpu_handles_exact_under_over_and_unknown_counts(
+    expected_count,
+):
+    nodes = _load_nodes()
+    source = (torch.full((4, 6, 3), i, dtype=torch.uint8) for i in range(5))
+
+    images = nodes._collect_comfy_images_cpu(source, expected_count=expected_count)
+
+    assert images.shape == (5, 4, 6, 3)
+    assert images.dtype == torch.float32
+    assert images.device.type == "cpu"
+    for i in range(5):
+        assert torch.allclose(images[i], torch.full((4, 6, 3), i / 255.0))
+
+
+def test_collect_comfy_images_cpu_returns_none_for_empty_source():
+    nodes = _load_nodes()
+    assert nodes._collect_comfy_images_cpu(iter(()), expected_count=10) is None
+    assert nodes._collect_comfy_images_cpu(iter(()), expected_count=0) is None
+
+
+def test_collect_comfy_images_cpu_does_not_retain_previous_frames():
+    import weakref
+
+    nodes = _load_nodes()
+    refs = []
+    alive_at_yield = []
+
+    def source():
+        for i in range(5):
+            alive_at_yield.append(sum(1 for r in refs if r() is not None))
+            frame = torch.full((4, 4, 3), i, dtype=torch.uint8)
+            refs.append(weakref.ref(frame))
+            yield frame
+
+    images = nodes._collect_comfy_images_cpu(source(), expected_count=5)
+
+    assert images.shape == (5, 4, 4, 3)
+    # Each frame is copied into the CPU buffer and released before the next is read.
+    assert max(alive_at_yield) == 0
+
+
+def test_decode_frames_nelux_streams_into_cpu_tensor(monkeypatch):
+    nodes = _load_nodes()
+
+    class _FakeVideoReader:
+        def __init__(self, path, **kwargs):
+            self.fps = 30.0
+            self.width = 4
+            self.height = 2
+            self.total_frames = 4
+            self._range = (0, 4)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def set_range(self, start, end):
+            self._range = (start, end)
+
+        def __iter__(self):
+            for i in range(*self._range):
+                yield torch.full((self.height, self.width, 3), i * 10, dtype=torch.uint8)
+
+    fake_nelux = types.SimpleNamespace(VideoReader=_FakeVideoReader)
+    monkeypatch.setattr(nodes, "_import_nelux", lambda: fake_nelux)
+    monkeypatch.setattr(nodes, "_resolve_accelerator", lambda path, choice: "cpu")
+
+    images, fps, width, height = nodes._decode_frames_nelux("clip.mp4", "auto")
+
+    assert (fps, width, height) == (30.0, 4, 2)
+    assert images.shape == (4, 2, 4, 3)
+    assert images.device.type == "cpu"
+    assert torch.allclose(images[3], torch.full((2, 4, 3), 30.0 / 255.0))
+
+
+def test_load_frames_cpu_streams_strided_frames(monkeypatch):
+    nodes = _load_nodes()
+
+    class _FakeVideoReader:
+        def __init__(self, path, **kwargs):
+            self.fps = 24.0
+            self.width = 2
+            self.height = 2
+            self.total_frames = 10
+            self._range = (0, 10)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def set_range(self, start, end):
+            self._range = (start, end)
+
+        def __iter__(self):
+            for i in range(*self._range):
+                yield torch.full((2, 2, 3), i, dtype=torch.uint8)
+
+    fake_nelux = types.SimpleNamespace(VideoReader=_FakeVideoReader)
+    monkeypatch.setattr(nodes, "_import_nelux", lambda: fake_nelux)
+    monkeypatch.setattr(nodes, "_resolve_accelerator", lambda path, choice: "cpu")
+
+    images, fps, width, height = nodes.NeluxLoadFrames().load(
+        "clip.mp4", start_frame=1, frame_count=3, step=2,
+        decode_accelerator="auto", output_device="cpu",
+        resize_width=0, resize_height=0,
+    )
+
+    assert (fps, width, height) == (24.0, 2, 2)
+    assert images.shape == (3, 2, 2, 3)
+    assert images.device.type == "cpu"
+    # Sampled frames: 1, 3, 5.
+    assert torch.allclose(images[0], torch.full((2, 2, 3), 1.0 / 255.0))
+    assert torch.allclose(images[1], torch.full((2, 2, 3), 3.0 / 255.0))
+    assert torch.allclose(images[2], torch.full((2, 2, 3), 5.0 / 255.0))
